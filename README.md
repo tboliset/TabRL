@@ -1,4 +1,3 @@
-\
 # TABRL: TabRL-Summarizer
 
 Two-stage text-to-table generation with LLMs, plus a MONA-style (multi-policy) RL blueprint and a full **T3-style atomic-statement pipeline** (atomize → schema → table).
