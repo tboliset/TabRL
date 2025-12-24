@@ -390,7 +390,7 @@ If you use this work, you can cite it as:
 ```bibtex
 @misc{tabrl-summarizer,
   title        = {TabRL-Summarizer: Two-Stage Text-to-Table Generation with MONA Multi-Policy Reinforcement Learning},
-  author       = {Patil, Arya and Bolisetty, Thanishka and Sharma, Simran and Pradhan, Hriday and Mehboob, Mohammed Usman},
+  author       = {Arya Patil, Thanishka Bolisetty, Simran Sharma, Hriday Pradhan, Mohammed Usman Mehboob},
   howpublished = {\url{https://github.com/tboliset/TABRL}},
   year         = {2025}
 }
