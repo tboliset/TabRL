@@ -1,408 +1,156 @@
-# TABRL: TabRL-Summarizer
+# TabRL two-stage text-to-table generation
 
-Two-stage text-to-table generation with LLMs, plus a MONA-style (multi-policy) RL blueprint and a full **T3-style atomic-statement pipeline** (atomize → schema → table).
+TabRL separates table generation into two inspectable steps: predict a typed JSON schema from source text, then generate a table conditioned on the text and schema. The project contains Llama 3.1 8B supervised fine-tuning workflows, LoRA checkpoints, stored predictions and a separate T3-style atomic-statement evaluation pipeline.
 
-This repository contains the code, training scripts, and docs for **TabRL-Summarizer**, a system that:
+The MONA-style reinforcement-learning extension is documented as a design. It is not a completed RL training result or evidence of improvement from RL.
 
-- Reads unstructured text (sports recaps, biographies, etc.).
-- **Stage 1 (π₁)**: predicts an explicit JSON **schema**.
-- **Stage 2 (π₂)**: uses the schema to generate a **table** as NDJSON.
-- Provides a complete pipeline of helper models that convert between **text, atomic statements, schemas, and tables**.
-- Designs a **multi‑policy RL extension** where schema and table policies get their own rewards.
+## Start with the evidence
 
-The layout below matches the committed Python files in this repo.
+- [Final team report](docs/Stratos_Final_Report.pdf): method, experiments and team contributions.
+- [Schema checkpoint](https://huggingface.co/mohdusman001/schema-gen-llama3-8b-stage1-merged) and [table checkpoint](https://huggingface.co/mohdusman001/pi2-table-llama3-8b-sft_final).
+- [Stored schema predictions](src/schema_model/SFT_output/testing_schema_table_schemas_pred.jsonl) and [stored table predictions](src/table_model/SFT_output/testing_schema_table_tables_pred.jsonl): 120 records each for error analysis, with separate malformed-output files.
+- [Testing inputs](examples/testing_input/testing_schema_table.jsonl): 120 text/schema/table records. These counts describe artifacts, not a quality score or a new evaluation.
 
----
-
-## Repository structure
+## Repository layout
 
 ```text
-TABRL/
-├─ docs/                            # Project reports and design docs
-│  ├─ Stratos_Final_Report.pdf
-│  ├─ Work_Till_Now_NLP.pdf
-│  └─ RL-pipeline.pdf
-├─ examples/
-│  └─ sample_input/
-│     └─ sample_data.jsonl          # Tiny demo dataset (text + schema/table)
-├─ src/
-│  ├─ common/
-│  │  └─ eval/
-│  │     ├─ map&make/               # Baseline map-and-make evaluation code
-│  │     ├─ tab_eval/               # Table evaluation utilities (metrics, parsing)
-│  │     ├─ entailment_eval.py      # (alt location) wrapper for NLI-based checks
-│  │     └─ tabunroll_infer.py      # (alt location) helpers for T3-style pipelines
-│  ├─ RL/                           # MONA RL design & (optional) prototype code
-│  ├─ schema_model/
-│  │  ├─ schema_instructions.py     # Prompt / message templates for π₁
-│  │  └─ schema_train_sft.py        # Small wrapper around train_sft_stage_one.py
-│  └─ table_model/
-│     ├─ table_instructions.py      # Prompt / message templates for π₂
-│     └─ table_train_sft.py         # Small wrapper around train_sft_stage_two.py
-├─ train_sft_stage_one.py           # Stage‑1 SFT trainer (text → schema)
-├─ train_sft_stage_two.py           # Stage‑2 SFT trainer (text + schema → table)
-├─ build_instructions_stage_one.py  # Build Stage‑1 SFT chat messages
-├─ build_instructions_stage_two.py  # Build Stage‑2 SFT chat messages
-├─ atomize_llama31.py               # (atomize_llama31) Text → atomic statements
-├─ statement-gen.py                 # Atomic statements → schema text
-├─ table-gen.py                     # Atomic statements + schema → completed table
-├─ tabunroll_infer.py               # Table → atomic statements (T3 “unroll”)
-├─ entailment_eval.py               # NLI-based entailment / contradiction scorer
-└─ README.md
+TabRL/
+├── docs/
+│   ├── Stratos_Final_Report.pdf
+│   ├── Work_Till_Now_NLP.pdf
+│   └── RL-pipeline.pdf
+├── examples/
+│   ├── sample_input/sample_data.jsonl
+│   └── testing_input/testing_schema_table.jsonl
+├── src/
+│   ├── schema_model/
+│   │   ├── schema_instructions.py
+│   │   ├── schema_train_sft.py
+│   │   └── SFT_output/
+│   ├── table_model/
+│   │   ├── table_instructions.py
+│   │   ├── table_train_sft.py
+│   │   └── SFT_output/
+│   └── common/eval/
+│       ├── map&make/
+│       │   ├── atomization.py
+│       │   ├── schema_generator.py
+│       │   └── table_generator.py
+│       └── tab_eval/
+│           ├── tabunroll_infer.py
+│           └── entailment_eval.py
+└── README.md
 ```
 
-> Depending on where you place `entailment_eval.py` and `tabunroll_infer.py`, they may live either in `src/common/eval` or the repo root. The README assumes they exist and are importable from your Python path; adjust paths if you move files around.
+The trainers are the substantive scripts under `src/schema_model/` and `src/table_model/`, not wrappers around missing root-level files. There is no committed `src/RL/` implementation directory; the RL design is in the PDFs.
 
----
+## Inspect without training or model downloads
 
-## Data format
-
-Most scripts in this repo expect **JSONL** (one JSON object per line). In general an example looks like:
-
-```json
-{
-  "id": 0,
-  "summary": "Free-form text describing the game, person, or entity...",
-  "table": {...},                     // optional ground-truth table
-  "schema": {...},                    // optional structured schema
-  "atomic_statements": [...],         // optional list of atomic statements
-  "...": "..."
-}
-```
-
-Individual scripts specialize this schema (see script‑specific sections below).
-
-The file `examples/sample_input/sample_data.jsonl` contains a tiny, self-contained demo that you can run end‑to‑end without any external datasets.
-
----
-
-## Stage‑1 SFT: text → schema (π₁)
-
-### Purpose
-
-Train a schema policy π₁ that maps documents to compact JSON schemas using Llama‑3.1 + LoRA with VERL/FSDP on H100s.
-
-### Script: `train_sft_stage_one.py`
-
-- 3‑stage schedule (short → medium → long context).
-- Uses VERL’s trainer with FSDP + FlashAttention‑2.
-- Builds Parquet caches from JSONL.
-- Supports explicit time budgets (`--stage*_hours`) and a **hard cap** on steps via `--max_steps`.
-- Designed for 2× H100 but can be run with fewer GPUs with smaller batch sizes.
-
-**Key arguments (subset):**
-
-- `--train_file` : path to Stage‑1 SFT training JSONL.
-- `--eval_file`  : path to validation JSONL.
-- `--output_dir` : directory to write checkpoints / logs.
-- `--base_model` : HF model id (e.g. `meta-llama/Meta-Llama-3.1-8B-Instruct`).
-- `--max_steps`  : hard upper bound on total training steps.
-- LoRA options: `--lora_rank`, `--lora_alpha`, `--lora_dropout`, `--lora_targets`.
-
-**Typical usage:**
+From the repository root:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 \
-python train_sft_stage_one.py \
-  --train_file /path/to/schema_sft_train.jsonl \
-  --eval_file  /path/to/schema_sft_valid.jsonl \
+python3 src/schema_model/schema_instructions.py --help
+python3 src/table_model/table_instructions.py --help
+python3 src/schema_model/schema_train_sft.py --help
+python3 src/table_model/table_train_sft.py --help
+```
+
+These four entry points parse help before training dependencies or model loading. They are a small way to inspect the actual command-line interfaces, not an end-to-end training test. The committed sample has 18 records; it is an input fixture, not a complete training dataset.
+
+The GPU training and inference commands below require a separately configured compatible environment and access to the selected base model. This repository does not provide a pinned environment lockfile. The training scripts check PyTorch, VERL, FlashAttention-2, PEFT, Transformers, Datasets and PyArrow; the atomic-statement inference scripts additionally import vLLM. Match library and CUDA versions to the target machine. Documentation path checks do not establish a newly reproduced training run.
+
+## Prepare supervised instruction data
+
+The committed input examples use JSONL records with `id`, `text`, `schema` and `table`. The schema and table builders have different output-directory flag spellings:
+
+```bash
+python3 src/schema_model/schema_instructions.py \
+  --inputs examples/sample_input/sample_data.jsonl \
+  --out_dir outputs/schema_messages
+
+python3 src/table_model/table_instructions.py \
+  --inputs examples/sample_input/sample_data.jsonl \
+  --out-dir outputs/table_messages
+```
+
+The schema builder constructs system/user/assistant messages for minimal schema induction. It skips examples without text, schema or columns. The table builder validates required fields and schema/table column consistency before producing messages whose assistant target is NDJSON. Use actual training and validation data prepared with the same builders for a training run; do not treat the small shared sample as an independent evaluation split.
+
+## Train the schema and table models
+
+Both trainers expose LoRA settings, staged context lengths, learning rates, batch settings, checkpointing and time budgets. The source defaults progress through 2,048, 4,096 and 8,192 tokens. `--max_steps` caps steps **per context stage**, not the entire three-stage run.
+
+Examples for a configured CUDA training environment:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python3 src/schema_model/schema_train_sft.py \
+  --train_file /path/to/schema_train_messages.jsonl \
+  --eval_file /path/to/schema_validation_messages.jsonl \
   --output_dir /path/to/checkpoints/schema_sft \
   --base_model meta-llama/Meta-Llama-3.1-8B-Instruct \
   --max_steps 200
-```
 
-### Script: `build_instructions_stage_one.py`
-
-Builds **Stage‑1 SFT chat messages** from raw merged JSONL.
-
-- Input JSONL: lines with at least `id`, document text, and a gold table/metadata.
-- Output JSONL: one object per line with:
-  - `"id"`
-  - `"messages"`: `[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", ...}, {"role": "assistant", ...}]`
-  - `"metadata"`: light metadata for debugging.
-
-It contains a large, domain‑agnostic **policy** for schema induction (naming rules, evidence requirements, constraints, missing‑value handling, etc.), which is rendered into the `[POLICY]` section of the user prompt.
-
-**Typical usage (conceptual):**
-
-```bash
-python build_instructions_stage_one.py \
-  --input  /path/to/merged_train.jsonl \
-  --output /path/to/schema_stage1_messages_train.jsonl
-```
-
-(Use the actual CLI flags from the script when you run it.)
-
----
-
-## Stage‑2 SFT: text + schema → table (π₂)
-
-### Purpose
-
-Train a table policy π₂ that maps (document, schema) pairs to completed tables emitted as NDJSON.
-
-### Script: `train_sft_stage_two.py`
-
-- Mirrors Stage‑1 trainer:
-  - 3‑stage schedule.
-  - VERL FSDP + FlashAttention‑2.
-  - Parquet caching and length bucketing.
-- Adds **post‑stage sanity checks**: LM loss, sample generations, JSONL validation (schema keys / order / types).
-
-**Key arguments (subset):**
-
-- `--train_file`, `--eval_file`, `--output_dir`, `--base_model`, `--max_steps` (same semantics as Stage‑1).
-- Additional options for bucketing, context length, etc., as documented in the script.
-
-**Typical usage:**
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1 \
-python train_sft_stage_two.py \
-  --train_file /path/to/table_sft_train.jsonl \
-  --eval_file  /path/to/table_sft_valid.jsonl \
+CUDA_VISIBLE_DEVICES=0,1 python3 src/table_model/table_train_sft.py \
+  --train_file /path/to/table_train_messages.jsonl \
+  --eval_file /path/to/table_validation_messages.jsonl \
   --output_dir /path/to/checkpoints/table_sft \
   --base_model meta-llama/Meta-Llama-3.1-8B-Instruct \
   --max_steps 200
 ```
 
-### Script: `build_instructions_stage_two.py`
+The scripts prepare Parquet data, launch VERL's FSDP SFT trainer and support checkpoint merging and sample generation. Source defaults are not a complete provenance record for every published checkpoint. Consult the report and checkpoint-specific records before attributing an exact training configuration or result.
 
-Builds **Stage‑2 SFT chat messages** from merged JSONL that already contains text, schema, and table.
+## Atomic-statement evaluation pipeline
 
-- **Input (per line):**
-
-  ```json
-  {
-    "id": "...",
-    "split": "...",
-    "text": "...",
-    "schema": {"table_id": "...", "columns": [...], "n_cols": ...},
-    "table":  {"table_id": "...", "columns": [...], "data": [[...], ...]}
-  }
-  ```
-
-- **Output (per line):**
-
-  ```json
-  {
-    "id": "...",
-    "messages": [
-      {"role": "system", "content": SYSTEM_PI2},
-      {"role": "user",    "content": USER_PROMPT},
-      {"role": "assistant","content": "<NDJSON>"}
-    ],
-    "metadata": {"table_id": "...", "split": "..."}
-  }
-  ```
-
-**Typical usage (from docstring):**
+The separate map-and-make pipeline uses vLLM to move from text to atomic statements, then a schema, then a table. These are base-model inference examples, not calls to the two fine-tuned checkpoints. The `map&make` paths must be quoted in a shell, and the base-model flag is `--model_name`.
 
 ```bash
-python build_instructions_stage_two.py \
-  --inputs /path/merged_train.jsonl /path/merged_validation.jsonl \
-  --out-dir /path/sft_stage2_messages
-```
+mkdir -p outputs
 
-Supports `.jsonl` and `.jsonl.gz`, and fails fast on invalid JSON.
-
----
-
-## Atomic statement / T3‑style pipeline
-
-These scripts implement a T3‑style pipeline that moves between **text, atomic statements, schemas, and tables** using Llama‑3.1 8B + vLLM.
-
-### 1. Text → atomic statements: `atomize_llama31.py`
-
-- Uses vLLM’s `LLM` engine for fast batched inference.
-- Builds chat prompts with the Llama‑3.1 chat template.
-- Reads JSONL like:
-
-  ```json
-  {"id": 0, "summary": "...", "table": {...}}
-  ```
-
-- Writes JSONL like:
-
-  ```json
-  {
-    "id": 0,
-    "summary": "...",
-    "table": {...},
-    "raw_output": "<full model text>",
-    "atomic_statements": [
-      "The Atlanta Hawks' record is 46 wins.",
-      "..."
-    ]
-  }
-  ```
-
-Important flags (see script):
-
-- `--input` / `--output`
-- `--base-model` (HF id for Llama‑3.1‑8B‑Instruct)
-- vLLM settings: `--tensor-parallel-size`, `--gpu-memory-utilization`, `--max-num-seqs`, etc.
-
-### 2. Atomic statements → schema text: `statement-gen.py`
-
-Given atomic statements, infer a table‑like schema using Llama‑3.1 + vLLM.
-
-- **Input JSONL** (from `atomize_llama31.py`):
-
-  ```json
-  {
-    "id": 0,
-    "summary": "...",
-    "table": {...},
-    "raw_output": "<atomization model text>",
-    "atomic_statements": ["...", "..."]
-  }
-  ```
-
-- **Output JSONL:**
-
-  ```json
-  {
-    "id": 0,
-    "summary": "...",
-    "table": {...},
-    "atomic_statements": [...],
-    "schema_raw_output": "<full schema model text>"
-  }
-  ```
-
-This `schema_raw_output` is a human‑readable text schema (row/column headers) that can be parsed or post‑processed into a JSON schema for π₂.
-
-### 3. Atomic statements + schema → completed table: `table-gen.py`
-
-Fill in tables from atomic statements plus schema using Llama‑3.1 + vLLM.
-
-- **Input JSONL:** (typically after `statement-gen.py` + a schema parser)
-
-  ```json
-  {
-    "id": 0,
-    "summary": "...",
-    "table": {...},                      // optional original table
-    "atomic_statements": [...],
-    "schema_raw_output": "<schema text>"
-  }
-  ```
-
-- **Output JSONL:** one object per line with the same fields plus a generated table representation (see the script for the exact key names).
-
-The script contains a `TABUNROLL_PROMPT` that describes how to interpret schemas and atomic statements when writing out table rows.
-
-### 4. Table → atomic statements: `tabunroll_infer.py`
-
-The “reverse” direction: given a table, ask Llama‑3.1 to write atomic statements describing every fact in the table.
-
-- Uses the same `TABUNROLL_PROMPT` family as `table-gen.py`.
-- Helpful for:
-  - Converting gold tables to statements for T3 evaluation.
-  - Debugging the schema/table models by seeing what the model “thinks” the table says.
-
-**Input / output:** JSONL with table fields; see the script for the precise shape.
-
----
-
-## Entailment and evaluation helpers
-
-### Script: `entailment_eval.py`
-
-- Loads **RoBERTa‑large‑MNLI** from Hugging Face.
-- Computes textual entailment / contradiction between pairs of strings (e.g., atomic statements vs. source text, or statement vs. table verbalization).
-- Can be used as an additional evaluator or reward component.
-
-Key behaviours:
-
-- Automatically chooses `cuda` if available, else `cpu`.
-- Reads JSONL inputs, scores each pair, and writes out entailment probabilities / labels.
-
-### `src/common/eval`
-
-The `src/common/eval` folder contains shared evaluation utilities:
-
-- `map&make/` – Baseline “map‑and‑make” table generation pipeline.
-- `tab_eval/` – Parsing / metric code for comparing predicted vs. gold tables.
-- `tabunroll_infer.py` & `entailment_eval.py` can be imported from here as part of larger eval scripts.
-
----
-
-## Running an end‑to‑end demo
-
-A small, conceptual example of how pieces connect (you can adapt paths to your exact setup):
-
-```bash
-# 1. Atomize summaries into statements
-python atomize_llama31.py \
-  --input  examples/sample_input/sample_data.jsonl \
+python3 'src/common/eval/map&make/atomization.py' \
+  --input examples/sample_input/sample_data.jsonl \
   --output outputs/atomized.jsonl \
-  --base-model meta-llama/Meta-Llama-3.1-8B-Instruct
+  --model_name meta-llama/Meta-Llama-3.1-8B-Instruct
 
-# 2. From atomic statements, infer a schema text
-python statement-gen.py \
-  --input  outputs/atomized.jsonl \
-  --output outputs/schema_raw.jsonl \
-  --base-model meta-llama/Meta-Llama-3.1-8B-Instruct
+python3 'src/common/eval/map&make/schema_generator.py' \
+  --input outputs/atomized.jsonl \
+  --output outputs/schema.jsonl \
+  --model_name meta-llama/Meta-Llama-3.1-8B-Instruct
 
-# 3. From atomic statements + schema text, generate tables
-python table-gen.py \
-  --input  outputs/schema_raw.jsonl \
-  --output outputs/generated_tables.jsonl \
-  --base-model meta-llama/Meta-Llama-3.1-8B-Instruct
+python3 'src/common/eval/map&make/table_generator.py' \
+  --input outputs/schema.jsonl \
+  --output outputs/tables.jsonl \
+  --model_name meta-llama/Meta-Llama-3.1-8B-Instruct
 ```
 
-Once you have `generated_tables.jsonl`, you can evaluate it against gold tables using the utilities in `src/common/eval/tab_eval` or by writing a small wrapper script.
+Atomization accepts `text` or `summary`. The later scripts consume the generated atomic-statement and schema fields. Other argument spellings also differ between scripts, so inspect their argument definitions before adapting batch or GPU settings. These examples have been checked against file paths and argument definitions, not newly executed with a model.
 
----
+[Table unrolling](src/common/eval/tab_eval/tabunroll_infer.py) converts tables back to atomic statements. [Entailment evaluation](src/common/eval/tab_eval/entailment_eval.py) uses RoBERTa-large-MNLI. The entailment script loads its model at module import, so importing it or asking for help can initiate model loading; it is not part of the no-download inspection above.
 
-## RL (MONA blueprint)
+## Results and limitations
 
-The `src/RL` folder contains the **design and prototype code** for multi‑policy RL:
+Read the report with its named baselines and evaluation conditions. Stored outputs include malformed generations so failures can be examined. A prompting comparison in that report is not an RL gain, and the available results do not establish uniformly best or state-of-the-art quality.
 
-- Schema policy (π₁) and table policy (π₂) are treated as **separate agents**.
-- Each has its own reward:
-  - **Schema rewards**: JSON validity, unique / non‑empty columns, allowed types, coverage vs. gold.
-  - **Table rewards**: JSON validity, schema adherence, type checks, table metrics (cell‑level F1, overlaps).
-- Rewards are **non‑aggregating**: you optimize π₁ on schema rewards and π₂ on table rewards, instead of mixing them.
-- The design is compatible with VERL‑style group relative preference training with KL regularization.
+The RL proposal treats schema and table policies separately, with structure/validity and table-quality rewards. Its design is described in [RL-pipeline.pdf](docs/RL-pipeline.pdf) and the [final report](docs/Stratos_Final_Report.pdf); no completed RL experiment is claimed here.
 
-Full design notes are in `docs/RL-pipeline.pdf` and `Stratos_Final_Report.pdf`.
+## Team and contributions
 
----
+Team: Arya Patil, Thanishka Bolisetty, Simran Sharma, Hriday Pradhan and Usman Mehboob Mohammed (listed as Mohammed Usman Mehboob in the original report).
 
-## Project documents (for reviewers)
+The final report credits Usman with system design, both SFT pipelines, data preparation, training runs and integration. See the report for the full team contribution split.
 
-If you’re a professor or recruiter skimming the repo, here is the recommended reading order:
-
-1. **README.md** (this file) – high‑level idea, code structure, and quickstart.
-2. **docs/Stratos_Final_Report.pdf** – paper‑style full report (method, experiments, RL design).
-3. **docs/Work_Till_Now_NLP.pdf** – accessible narrative explanation of the project.
-4. **docs/RL-pipeline.pdf** – deep dive into the RL training pipeline and engineering details.
-
----
+For the original project narrative, see [Work_Till_Now_NLP.pdf](docs/Work_Till_Now_NLP.pdf).
 
 ## Citation
 
-If you use this work, you can cite it as:
-
 ```bibtex
 @misc{tabrl-summarizer,
-  title        = {TabRL-Summarizer: Two-Stage Text-to-Table Generation with MONA Multi-Policy Reinforcement Learning},
-  author       = {Arya Patil, Thanishka Bolisetty, Simran Sharma, Hriday Pradhan, Mohammed Usman Mehboob},
-  howpublished = {\url{https://github.com/tboliset/TABRL}},
-  year         = {2025}
+  title = {TabRL-Summarizer: Two-Stage Text-to-Table Generation with MONA Multi-Policy Reinforcement Learning},
+  author = {Patil, Arya and Bolisetty, Thanishka and Sharma, Simran and Pradhan, Hriday and Mehboob, Mohammed Usman},
+  howpublished = {\url{https://github.com/tboliset/TabRL}},
+  year = {2025}
 }
 ```
 
-(Replace the GitHub URL with your actual repository link.)
+The project title retains the proposed RL direction; cite the report's specific completed methods and results rather than inferring an RL result from the title.
 
----
-
-## Contact
-
-Maintainer: **Mohammed Usman Mehboob**  
-Email: `musmanme@asu.edu`
-
-Feel free to reach out or open an issue if you have questions about the code, training scripts, or RL design.
+Contact: [musmanme@asu.edu](mailto:musmanme@asu.edu).
